@@ -3,30 +3,25 @@
   "id": "sentinel",
   "version": "${version}",
   "name": "Sentinel",
-  "description": "",
-  "authors": [],
+  "description": "Minecraft server backup, maintenance, and recovery utilities.",
+  "authors": [
+    "Maximus"
+  ],
   "contact": {},
   "license": "All-Rights-Reserved",
-  "icon": "assets/sentinel/icon.png",
   "environment": "*",
   "entrypoints": {
-    "client": [
-      "dev.maximus.sentinel.client.SentinelClient"
+    "preLaunch": [
+      "dev.maximus.sentinel.recovery.BootloopRecovery"
     ],
     "main": [
       "dev.maximus.sentinel.Sentinel"
     ]
   },
-  "mixins": [
-    "sentinel.mixins.json",
-    {
-      "config": "sentinel.client.mixins.json",
-      "environment": "client"
-    }
-  ],
   "depends": {
-    "fabricloader": ">=${loader_version}",
-    "fabric-api": "*",
-    "minecraft": "${minecraft_version}"
+    "fabricloader": ">=0.19.2",
+    "minecraft": "1.21.1",
+    "java": ">=21",
+    "fabric-api": ">=0.116.12+1.21.1"
   }
 }
