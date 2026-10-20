@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "id": "sentinel",
+  "version": "${version}",
+  "name": "Sentinel",
+  "description": "",
+  "authors": [],
+  "contact": {},
+  "license": "All-Rights-Reserved",
+  "icon": "assets/sentinel/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "client": [
+      "dev.maximus.sentinel.client.SentinelClient"
+    ],
+    "main": [
+      "dev.maximus.sentinel.Sentinel"
+    ]
+  },
+  "mixins": [
+    "sentinel.mixins.json",
+    {
+      "config": "sentinel.client.mixins.json",
+      "environment": "client"
+    }
+  ],
+  "depends": {
+    "fabricloader": ">=${loader_version}",
+    "fabric-api": "*",
+    "minecraft": "${minecraft_version}"
+  }
+}
