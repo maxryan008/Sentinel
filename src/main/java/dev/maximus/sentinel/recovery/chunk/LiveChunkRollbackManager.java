@@ -72,6 +72,7 @@ public final class LiveChunkRollbackManager {
         PREPARING,
         SWAPPING,
         RESTORING_ENTITIES,
+        RESTORING_POI,
         REBUILDING_LIGHT,
         SYNCHRONIZING
     }
@@ -96,6 +97,7 @@ public final class LiveChunkRollbackManager {
         ChunkLightingRestorer lightingRestorer;
 
         ChunkEntityRestorer.Result entityResult;
+        ChunkPoiRestorer.Result poiResult;
 
         Stage stage = Stage.READING;
 
@@ -127,12 +129,6 @@ public final class LiveChunkRollbackManager {
         return active != null;
     }
 
-    /**
-     * Starts an in-memory chunk rollback.
-     *
-     * Snapshot IO happens asynchronously.
-     * Minecraft world operations run on the server thread.
-     */
     public static void start(
             ServerLevel level,
             ChunkPos position,
@@ -145,14 +141,15 @@ public final class LiveChunkRollbackManager {
         if (server == null || !server.isSameThread()) {
 
             throw new IllegalStateException(
-                    "Chunk swap must start on the server thread."
+                    "Chunk rollback must start on "
+                            + "the server thread."
             );
         }
 
         if (active != null) {
 
             throw new IllegalStateException(
-                    "Another chunk swap is already running."
+                    "Another chunk rollback is already running."
             );
         }
 
@@ -191,9 +188,7 @@ public final class LiveChunkRollbackManager {
     }
 
     /**
-     * Advances the active transaction.
-     *
-     * Called by Sentinel from END_SERVER_TICK.
+     * Called from Sentinel's END_SERVER_TICK callback.
      */
     public static void tick(MinecraftServer server) {
 
@@ -206,8 +201,10 @@ public final class LiveChunkRollbackManager {
         try {
 
             if (!server.isSameThread()) {
+
                 throw new IllegalStateException(
-                        "Chunk swap must tick on the server thread."
+                        "Chunk rollback must tick on "
+                                + "the server thread."
                 );
             }
 
@@ -234,6 +231,9 @@ public final class LiveChunkRollbackManager {
                 case RESTORING_ENTITIES ->
                         restoreEntities(transaction);
 
+                case RESTORING_POI ->
+                        restorePoi(transaction);
+
                 case REBUILDING_LIGHT ->
                         rebuildLighting(transaction);
 
@@ -244,7 +244,7 @@ public final class LiveChunkRollbackManager {
         } catch (Throwable exception) {
 
             Sentinel.LOGGER.error(
-                    "In-memory chunk swap failed at stage {}",
+                    "Chunk rollback failed at stage {}",
                     transaction.stage,
                     exception
             );
@@ -257,8 +257,8 @@ public final class LiveChunkRollbackManager {
             );
 
             /*
-             * This does not reverse an already committed
-             * chunk swap or entity restoration.
+             * A failure after SWAPPING is not
+             * automatically reversed.
              */
             active = null;
         }
@@ -285,14 +285,10 @@ public final class LiveChunkRollbackManager {
         transaction.stage = Stage.PREPARING;
 
         transaction.feedback.accept(
-                "Snapshot loaded; constructing replacement chunk."
+                "Snapshot loaded; preparing replacement chunk."
         );
     }
 
-    /**
-     * Deserializes the terrain and prepares saved
-     * block-entity NBT.
-     */
     private static void prepareReplacement(
             Transaction transaction
     ) {
@@ -320,7 +316,8 @@ public final class LiveChunkRollbackManager {
         )) {
 
             throw new IllegalStateException(
-                    "Deserialized chunk coordinates differ."
+                    "Snapshot chunk coordinates differ "
+                            + "from the requested chunk."
             );
         }
 
@@ -340,8 +337,8 @@ public final class LiveChunkRollbackManager {
     }
 
     /**
-     * Places complete block-entity NBT into the
-     * replacement chunk before activation.
+     * Copies the complete saved block-entity NBT
+     * into the replacement LevelChunk.
      */
     private static void loadBlockEntityNbt(
             Transaction transaction
@@ -350,23 +347,23 @@ public final class LiveChunkRollbackManager {
         LevelChunk replacement =
                 transaction.replacement;
 
-        CompoundTag terrain =
-                transaction.records.terrain();
-
-        ListTag saved = terrain.getList(
-                "block_entities",
-                Tag.TAG_COMPOUND
-        );
+        ListTag saved =
+                transaction.records.terrain().getList(
+                        "block_entities",
+                        Tag.TAG_COMPOUND
+                );
 
         Set<BlockPos> seen = new HashSet<>();
 
         int copied = 0;
         int rejected = 0;
 
-        for (int i = 0; i < saved.size(); i++) {
+        for (int index = 0;
+             index < saved.size();
+             index++) {
 
             CompoundTag tag =
-                    saved.getCompound(i).copy();
+                    saved.getCompound(index).copy();
 
             if (!tag.contains("x", Tag.TAG_INT)
                     || !tag.contains("y", Tag.TAG_INT)
@@ -402,18 +399,14 @@ public final class LiveChunkRollbackManager {
         }
 
         Sentinel.LOGGER.info(
-                "Prepared block-entity NBT for chunk {}: "
-                        + "copied={}, rejected={}",
+                "Prepared block-entity NBT: "
+                        + "chunk={}, copied={}, rejected={}",
                 transaction.position,
                 copied,
                 rejected
         );
     }
 
-    /**
-     * Instantiates the restored block entities
-     * from their saved NBT.
-     */
     private static void materializeBlockEntities(
             Transaction transaction
     ) {
@@ -432,10 +425,12 @@ public final class LiveChunkRollbackManager {
         int restored = 0;
         int failed = 0;
 
-        for (int i = 0; i < saved.size(); i++) {
+        for (int index = 0;
+             index < saved.size();
+             index++) {
 
             CompoundTag tag =
-                    saved.getCompound(i);
+                    saved.getCompound(index);
 
             if (!tag.contains("x", Tag.TAG_INT)
                     || !tag.contains("y", Tag.TAG_INT)
@@ -472,10 +467,9 @@ public final class LiveChunkRollbackManager {
             if (entity == null) {
 
                 Sentinel.LOGGER.warn(
-                        "Failed to materialize block entity "
-                                + "at {} in {}",
-                        position,
-                        transaction.position
+                        "Unable to materialize block entity "
+                                + "at {}",
+                        position
                 );
 
                 failed++;
@@ -483,19 +477,17 @@ public final class LiveChunkRollbackManager {
             }
 
             entity.setChanged();
-
             restored++;
         }
 
         transaction.restoredBlockEntities = restored;
 
         replacement.registerAllBlockEntitiesAfterLevelLoad();
-
         replacement.setUnsaved(true);
 
         Sentinel.LOGGER.info(
-                "Restored block entities in chunk {}: "
-                        + "restored={}, failed={}",
+                "Restored block entities: "
+                        + "chunk={}, restored={}, failed={}",
                 transaction.position,
                 restored,
                 failed
@@ -503,10 +495,8 @@ public final class LiveChunkRollbackManager {
     }
 
     /**
-     * Replaces the active LevelChunk object.
-     *
-     * Both the FULL generation future and the
-     * accessible/ticking futures are updated.
+     * Replace the authoritative LevelChunk while
+     * preserving the active ChunkHolder.
      */
     private static void swap(
             Transaction transaction
@@ -605,9 +595,6 @@ public final class LiveChunkRollbackManager {
         var oldEntityTickingFuture =
                 holder.sentinel$getEntityTickingChunkFuture();
 
-        /*
-         * Change the generation and ticking results.
-         */
         generationFutures.set(
                 fullIndex,
                 generationResolved
@@ -628,10 +615,6 @@ public final class LiveChunkRollbackManager {
         ((ServerChunkCacheSwapAccessor) (Object) cache)
                 .sentinel$clearCache();
 
-        /*
-         * Verify server-side authoritative lookups
-         * before removing the old runtime registrations.
-         */
         LevelChunk cached =
                 cache.getChunkNow(
                         transaction.position.x,
@@ -668,23 +651,15 @@ public final class LiveChunkRollbackManager {
                     .sentinel$clearCache();
 
             throw new IllegalStateException(
-                    "Chunk lookup verification failed. "
-                            + "Original holder futures restored."
+                    "Chunk lookup verification failed."
             );
         }
 
-        /*
-         * The replacement now appears in both
-         * primary server lookup paths.
-         */
         original.unregisterTickContainerFromLevel(level);
-
         original.clearAllBlockEntities();
-
         original.setLoaded(false);
 
         replacement.setLoaded(true);
-
         replacement.registerTickContainerInLevel(level);
 
         materializeBlockEntities(transaction);
@@ -692,29 +667,21 @@ public final class LiveChunkRollbackManager {
         replacement.setUnsaved(true);
 
         Sentinel.LOGGER.info(
-                "Chunk object replaced: chunk={}, "
-                        + "original={}, replacement={}, "
-                        + "blockEntities={}",
+                "Chunk object replaced: "
+                        + "chunk={}, original={}, replacement={}",
                 transaction.position,
                 System.identityHashCode(original),
-                System.identityHashCode(replacement),
-                transaction.restoredBlockEntities
+                System.identityHashCode(replacement)
         );
 
         transaction.stage = Stage.RESTORING_ENTITIES;
 
         transaction.feedback.accept(
                 "Terrain and block entities restored; "
-                        + "reconciling non-player entities."
+                        + "restoring entities."
         );
     }
 
-    /**
-     * Restores non-player entities from the snapshot.
-     *
-     * Matching UUIDs are removed from loaded dimensions
-     * before the snapshot versions are recreated.
-     */
     private static void restoreEntities(
             Transaction transaction
     ) {
@@ -726,7 +693,29 @@ public final class LiveChunkRollbackManager {
                         transaction.records.entities()
                 );
 
-        transaction.stage = Stage.REBUILDING_LIGHT;
+        transaction.stage = Stage.RESTORING_POI;
+
+        transaction.feedback.accept(
+                "Entities restored; restoring POI data."
+        );
+    }
+
+    /**
+     * Restores the authoritative POI column.
+     *
+     * This stage runs after terrain replacement
+     * and before lighting/client synchronisation.
+     */
+    private static void restorePoi(
+            Transaction transaction
+    ) {
+
+        transaction.poiResult =
+                ChunkPoiRestorer.restore(
+                        transaction.level,
+                        transaction.position,
+                        transaction.records.poi()
+                );
 
         transaction.lightingRestorer =
                 new ChunkLightingRestorer(
@@ -736,17 +725,15 @@ public final class LiveChunkRollbackManager {
                         transaction.replacement
                 );
 
+        transaction.stage = Stage.REBUILDING_LIGHT;
+
         transaction.feedback.accept(
-                "Entities restored: "
-                        + transaction.entityResult.restored()
-                        + ". Rebuilding lighting."
+                "POIs restored: "
+                        + transaction.poiResult.restoredRecords()
+                        + " records. Rebuilding lighting."
         );
     }
 
-    /**
-     * Recalculates lighting where the original and
-     * replacement block states differ.
-     */
     private static void rebuildLighting(
             Transaction transaction
     ) {
@@ -758,14 +745,10 @@ public final class LiveChunkRollbackManager {
         transaction.stage = Stage.SYNCHRONIZING;
 
         transaction.feedback.accept(
-                "Lighting scan completed; synchronizing clients."
+                "Lighting rebuilt; synchronizing clients."
         );
     }
 
-    /**
-     * Sends the restored chunk to nearby players
-     * after entity reconciliation and lighting updates.
-     */
     private static void synchronize(
             Transaction transaction
     ) {
@@ -840,6 +823,9 @@ public final class LiveChunkRollbackManager {
         ChunkEntityRestorer.Result entities =
                 transaction.entityResult;
 
+        ChunkPoiRestorer.Result pois =
+                transaction.poiResult;
+
         transaction.feedback.accept(
                 "Chunk rollback completed for "
                         + transaction.position
@@ -847,39 +833,32 @@ public final class LiveChunkRollbackManager {
                         + transaction.restoredBlockEntities
                         + ", entities restored: "
                         + entities.restored()
-                        + ", entities removed from target: "
-                        + entities.removedFromTarget()
-                        + ", entities removed by UUID: "
-                        + entities.removedByUuid()
-                        + ", entity failures: "
-                        + entities.failed()
-                        + ", lighting changes queued: "
-                        + transaction.lightingRestorer.changedBlocks()
-                        + ". Unloaded-entity UUID reconciliation "
-                        + "and POI restoration remain incomplete."
+                        + ", POI records restored: "
+                        + pois.restoredRecords()
+                        + ", old POI records: "
+                        + pois.previousRecords()
+                        + ", lighting checks: "
+                        + transaction.lightingRestorer.lightingChecks()
         );
 
         Sentinel.LOGGER.info(
-                "Chunk rollback finished: "
+                "Chunk rollback completed: "
                         + "dimension={}, chunk={}, "
                         + "blockEntities={}, entities={}, "
-                        + "uuidRelocations={}, lightingChanges={}",
+                        + "poiRecords={}, previousPoiRecords={}, "
+                        + "lightChecks={}",
                 level.dimension().location(),
                 transaction.position,
                 transaction.restoredBlockEntities,
                 entities.restored(),
-                entities.removedByUuid(),
-                transaction.lightingRestorer.changedBlocks()
+                pois.restoredRecords(),
+                pois.previousRecords(),
+                transaction.lightingRestorer.lightingChecks()
         );
 
         active = null;
     }
 
-    /**
-     * Cancels pending snapshot preparation.
-     *
-     * Does not reverse a committed runtime swap.
-     */
     public static void shutdown() {
 
         if (active != null

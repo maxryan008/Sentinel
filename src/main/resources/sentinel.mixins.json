@@ -7,9 +7,11 @@
     "recovery.ChunkHolderSwapAccessor",
     "recovery.ChunkMapSwapAccessor",
     "recovery.GenerationChunkHolderSwapAccessor",
+    "recovery.LightEngineCacheMixin",
+    "recovery.PoiManagerAccessor",
     "recovery.RegionFileStorageInvoker",
-    "recovery.ServerChunkCacheSwapAccessor",
-    "recovery.LightEngineCacheMixin"
+    "recovery.SectionStorageAccessor",
+    "recovery.ServerChunkCacheSwapAccessor"
   ],
   "injectors": {
     "defaultRequire": 1
