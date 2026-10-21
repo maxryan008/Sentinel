@@ -2,6 +2,9 @@ package dev.maximus.sentinel.recovery.chunk;
 
 import dev.maximus.sentinel.Sentinel;
 
+import dev.maximus.sentinel.recovery.entity.SentinelEntityGeneration;
+import dev.maximus.sentinel.recovery.entity.SentinelEntityGenerationLedger;
+
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.Tag;
@@ -12,6 +15,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.player.Player;
+
 import net.minecraft.world.level.ChunkPos;
 
 import java.util.ArrayList;
@@ -36,12 +40,19 @@ public final class ChunkEntityRestorer {
     }
 
     /**
-     * Restores the snapshot's non-player entity population.
+     * Restores the backed-up non-player entity
+     * population for one chunk.
      *
-     * Players are never removed, recreated, or moved.
+     * Current matching UUIDs in loaded dimensions
+     * are removed before their snapshot versions
+     * are reconstructed.
      *
-     * This method must execute on the server thread,
-     * after the terrain chunk swap.
+     * Every restored entity receives a persistent
+     * generation ID that prevents older unloaded
+     * copies of the same UUID from being admitted
+     * into Minecraft's entity manager.
+     *
+     * Must run on the server thread.
      */
     public static Result restore(
             ServerLevel targetLevel,
@@ -49,11 +60,14 @@ public final class ChunkEntityRestorer {
             CompoundTag entityRecord
     ) {
 
-        MinecraftServer server = targetLevel.getServer();
+        MinecraftServer server =
+                targetLevel.getServer();
 
         if (server == null || !server.isSameThread()) {
+
             throw new IllegalStateException(
-                    "Entity restoration must run on the server thread."
+                    "Entity restoration must execute "
+                            + "on the server thread."
             );
         }
 
@@ -61,15 +75,14 @@ public final class ChunkEntityRestorer {
                 readSavedEntities(entityRecord);
 
         /*
-         * Deserialize all replacement entities before
-         * deleting anything from the active world.
-         *
-         * EntityType.loadEntitiesRecursive restores
-         * passenger relationships from serialized NBT.
+         * Construct the replacement entities before
+         * modifying the active world.
          */
-        List<Tag> serialized = new ArrayList<>();
+        List<Tag> serialized =
+                new ArrayList<>();
 
         for (CompoundTag tag : savedTags) {
+
             serialized.add(tag.copy());
         }
 
@@ -80,40 +93,71 @@ public final class ChunkEntityRestorer {
                 ).toList();
 
         /*
-         * Build the UUID set for all replacement entities,
-         * including recursively loaded passengers.
-         *
-         * We must not restore a UUID twice.
+         * Gather and validate the UUIDs of all
+         * replacement entities and passengers.
          */
-        Set<UUID> replacementUuids = new HashSet<>();
+        Set<UUID> replacementUuids =
+                new HashSet<>();
 
         for (Entity root : replacements) {
 
-            for (Entity entity :
+            if (!root.chunkPosition().equals(
+                    targetChunk
+            )) {
+
+                throw new IllegalStateException(
+                        "Snapshot contains entity "
+                                + root.getUUID()
+                                + " outside the target chunk "
+                                + targetChunk
+                );
+            }
+
+            for (Entity member :
                     root.getSelfAndPassengers().toList()) {
 
-                if (entity instanceof Player) {
+                if (member instanceof Player) {
+
                     throw new IllegalStateException(
-                            "Snapshot entity record contains a player."
+                            "Entity snapshot unexpectedly "
+                                    + "contains a player."
                     );
                 }
 
-                if (!replacementUuids.add(entity.getUUID())) {
+                if (!replacementUuids.add(
+                        member.getUUID()
+                )) {
+
                     throw new IllegalStateException(
-                            "Duplicate UUID in snapshot entities: "
-                                    + entity.getUUID()
+                            "Duplicate entity UUID in snapshot: "
+                                    + member.getUUID()
                     );
                 }
             }
         }
 
         /*
-         * Locate active entities across every loaded
-         * dimension.
-         *
-         * This supports entities that have moved into
-         * another loaded chunk or dimension after
-         * the backup was created.
+         * Never allow a saved non-player entity to
+         * override a currently connected player's UUID.
+         */
+        for (var player :
+                server.getPlayerList().getPlayers()) {
+
+            if (replacementUuids.contains(
+                    player.getUUID()
+            )) {
+
+                throw new IllegalStateException(
+                        "Snapshot entity UUID conflicts "
+                                + "with player "
+                                + player.getUUID()
+                );
+            }
+        }
+
+        /*
+         * Identify active copies across every
+         * loaded dimension.
          */
         Map<UUID, Entity> activeByUuid =
                 new HashMap<>();
@@ -121,9 +165,11 @@ public final class ChunkEntityRestorer {
         List<Entity> activeInTarget =
                 new ArrayList<>();
 
-        for (ServerLevel level : server.getAllLevels()) {
+        for (ServerLevel level :
+                server.getAllLevels()) {
 
-            for (Entity entity : level.getAllEntities()) {
+            for (Entity entity :
+                    level.getAllEntities()) {
 
                 if (entity instanceof Player) {
                     continue;
@@ -149,19 +195,51 @@ public final class ChunkEntityRestorer {
         }
 
         /*
-         * Never delete or overwrite a player whose UUID
-         * conflicts with an entity in the snapshot.
+         * CRITICAL:
+         *
+         * Create and persist the new generations
+         * before removing any live entities.
+         *
+         * The entity manager's duplicate-rejection
+         * Mixin will subsequently consider only
+         * these generations authoritative.
          */
-        for (var player :
-                server.getPlayerList().getPlayers()) {
+        SentinelEntityGenerationLedger ledger =
+                SentinelEntityGenerationLedger.get(server);
 
-            if (replacementUuids.contains(
-                    player.getUUID()
-            )) {
-                throw new IllegalStateException(
-                        "Snapshot entity UUID conflicts with player "
-                                + player.getUUID()
-                );
+        Map<UUID, UUID> newGenerations =
+                ledger.claimAll(replacementUuids);
+
+        /*
+         * Assign the generations to the newly
+         * reconstructed entities.
+         *
+         * The EntityGenerationMixin will write
+         * these values into the entities' NBT
+         * when Minecraft saves them.
+         */
+        for (Entity root : replacements) {
+
+            for (Entity member :
+                    root.getSelfAndPassengers().toList()) {
+
+                UUID generation =
+                        newGenerations.get(
+                                member.getUUID()
+                        );
+
+                if (generation == null) {
+
+                    throw new IllegalStateException(
+                            "Missing generation for "
+                                    + member.getUUID()
+                    );
+                }
+
+                ((SentinelEntityGeneration) member)
+                        .sentinel$setRestorationGeneration(
+                                generation
+                        );
             }
         }
 
@@ -170,29 +248,23 @@ public final class ChunkEntityRestorer {
         int restored = 0;
         int failed = 0;
 
-        /*
-         * First remove non-player entities currently
-         * occupying the restored chunk.
-         *
-         * Entities created after the snapshot should
-         * not remain in the rolled-back chunk.
-         */
-        Set<Entity> removed = new HashSet<>();
+        Set<Entity> removed =
+                new HashSet<>();
 
+        /*
+         * Remove entities created or modified
+         * inside the target chunk after the backup.
+         *
+         * Players are not affected.
+         */
         for (Entity entity : activeInTarget) {
 
-            /*
-             * Passengers and vehicles can cross chunk
-             * boundaries. A complete vehicle hierarchy
-             * must be considered before removal.
-             *
-             * Dismounting prevents a surviving vehicle
-             * retaining the removed entity as a passenger.
-             */
             entity.stopRiding();
 
             for (Entity passenger :
-                    List.copyOf(entity.getPassengers())) {
+                    List.copyOf(
+                            entity.getPassengers()
+                    )) {
 
                 passenger.stopRiding();
             }
@@ -205,16 +277,11 @@ public final class ChunkEntityRestorer {
         }
 
         /*
-         * Now remove matching UUIDs elsewhere.
-         *
-         * Example:
-         * A wolf existed in this chunk at backup time,
-         * but has subsequently walked elsewhere.
-         *
-         * Its current instance must disappear before
-         * its saved instance can be spawned.
+         * Remove matching UUIDs that have moved into
+         * other loaded chunks or dimensions.
          */
-        for (Entity entity : activeByUuid.values()) {
+        for (Entity entity :
+                activeByUuid.values()) {
 
             if (removed.contains(entity)) {
                 continue;
@@ -223,7 +290,9 @@ public final class ChunkEntityRestorer {
             entity.stopRiding();
 
             for (Entity passenger :
-                    List.copyOf(entity.getPassengers())) {
+                    List.copyOf(
+                            entity.getPassengers()
+                    )) {
 
                 passenger.stopRiding();
             }
@@ -236,44 +305,16 @@ public final class ChunkEntityRestorer {
         }
 
         /*
-         * Recreate the snapshot entities.
+         * Spawn the restored entities.
          *
-         * Root entities are spawned with their passengers
-         * so their saved riding relationships are preserved.
+         * All members of each passenger hierarchy
+         * have already received their authoritative
+         * generation markers.
          */
         for (Entity root : replacements) {
 
             try {
 
-                if (root instanceof Player) {
-                    continue;
-                }
-
-                /*
-                 * All top-level entities in an entity-region
-                 * record should belong to the target chunk.
-                 */
-                if (!root.chunkPosition().equals(
-                        targetChunk
-                )) {
-
-                    Sentinel.LOGGER.warn(
-                            "Skipping snapshot entity {} "
-                                    + "outside target chunk {}",
-                            root.getUUID(),
-                            targetChunk
-                    );
-
-                    failed++;
-                    continue;
-                }
-
-                /*
-                 * Check for a surviving loaded UUID conflict.
-                 *
-                 * This can occur if a mod introduces an entity
-                 * between preparation and insertion.
-                 */
                 boolean conflict = false;
 
                 for (Entity member :
@@ -299,8 +340,9 @@ public final class ChunkEntityRestorer {
                 if (conflict) {
 
                     Sentinel.LOGGER.warn(
-                            "Skipping entity {} because a UUID "
-                                    + "is still active.",
+                            "Skipping restored entity {} "
+                                    + "because its UUID is "
+                                    + "still active.",
                             root.getUUID()
                     );
 
@@ -308,11 +350,40 @@ public final class ChunkEntityRestorer {
                     continue;
                 }
 
-                targetLevel.addFreshEntityWithPassengers(root);
+                targetLevel.addFreshEntityWithPassengers(
+                        root
+                );
 
-                restored += (int) root
-                        .getSelfAndPassengers()
-                        .count();
+                int members =
+                        (int) root
+                                .getSelfAndPassengers()
+                                .count();
+
+                /*
+                 * The number of returned entities
+                 * is not a definitive admission count.
+                 *
+                 * Verify the entity manager accepted
+                 * the root after insertion.
+                 */
+                Entity admitted =
+                        targetLevel.getEntity(
+                                root.getUUID()
+                        );
+
+                if (admitted != root) {
+
+                    Sentinel.LOGGER.error(
+                            "Restored entity {} was not "
+                                    + "accepted by the entity manager.",
+                            root.getUUID()
+                    );
+
+                    failed++;
+                    continue;
+                }
+
+                restored += members;
 
             } catch (Exception exception) {
 
@@ -327,16 +398,18 @@ public final class ChunkEntityRestorer {
         }
 
         Sentinel.LOGGER.info(
-                "Entity rollback in {} chunk {}: "
+                "Entity rollback: dimension={}, chunk={}, "
                         + "removedFromTarget={}, "
                         + "removedByUuid={}, "
-                        + "restored={}, failed={}",
+                        + "restored={}, failed={}, "
+                        + "persistentGenerations={}",
                 targetLevel.dimension().location(),
                 targetChunk,
                 removedFromTarget,
                 removedByUuid,
                 restored,
-                failed
+                failed,
+                newGenerations.size()
         );
 
         return new Result(
@@ -348,10 +421,7 @@ public final class ChunkEntityRestorer {
     }
 
     /**
-     * Reads the vanilla entity-region NBT record.
-     *
-     * A missing entity record means the snapshot
-     * contained no saved entities for this chunk.
+     * Reads the vanilla entity-region record.
      */
     private static List<CompoundTag> readSavedEntities(
             CompoundTag record
@@ -360,6 +430,10 @@ public final class ChunkEntityRestorer {
         List<CompoundTag> result =
                 new ArrayList<>();
 
+        /*
+         * A missing entity record means that no
+         * entities were saved in this chunk.
+         */
         if (record == null) {
             return result;
         }
@@ -368,15 +442,17 @@ public final class ChunkEntityRestorer {
                 "Entities",
                 Tag.TAG_LIST
         )) {
+
             throw new IllegalArgumentException(
                     "Entity record has no Entities list."
             );
         }
 
-        ListTag entities = record.getList(
-                "Entities",
-                Tag.TAG_COMPOUND
-        );
+        ListTag entities =
+                record.getList(
+                        "Entities",
+                        Tag.TAG_COMPOUND
+                );
 
         for (int index = 0;
              index < entities.size();

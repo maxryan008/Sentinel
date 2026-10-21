@@ -6,8 +6,10 @@
   "mixins": [
     "recovery.ChunkHolderSwapAccessor",
     "recovery.ChunkMapSwapAccessor",
+    "recovery.EntityGenerationMixin",
     "recovery.GenerationChunkHolderSwapAccessor",
     "recovery.LightEngineCacheMixin",
+    "recovery.PersistentEntitySectionManagerMixin",
     "recovery.PoiManagerAccessor",
     "recovery.RegionFileStorageInvoker",
     "recovery.SectionStorageAccessor",
