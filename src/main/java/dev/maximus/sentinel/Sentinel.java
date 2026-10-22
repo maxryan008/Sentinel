@@ -7,6 +7,7 @@ import dev.maximus.sentinel.command.ChunkRollbackCommands;
 
 import dev.maximus.sentinel.config.SentinelConfig;
 
+import dev.maximus.sentinel.gui.*;
 import dev.maximus.sentinel.recovery.BootloopRecovery;
 import dev.maximus.sentinel.recovery.RestoreScriptGenerator;
 import dev.maximus.sentinel.recovery.RollbackManager;
@@ -40,8 +41,16 @@ public final class Sentinel implements ModInitializer {
     @Override
     public void onInitialize() {
 
+        SnapshotGuiPackets.register();
+        ChunkMapPackets.register();
+        ChunkRegionPackets.register();
+
         SentinelCommands.register();
         ChunkRollbackCommands.register();
+
+        SnapshotGuiServer.register();
+        ChunkMapServer.register();
+        ChunkRegionServer.register();
 
         /*
          * Initialise the backup manager whenever a

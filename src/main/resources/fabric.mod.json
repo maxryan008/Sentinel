@@ -16,6 +16,9 @@
     ],
     "main": [
       "dev.maximus.sentinel.Sentinel"
+    ],
+    "client": [
+      "dev.maximus.sentinel.client.SentinelClient"
     ]
   },
   "depends": {
